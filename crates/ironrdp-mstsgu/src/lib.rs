@@ -466,6 +466,7 @@ impl GwClient {
             let iv = Duration::from_secs(15 * 60);
             let mut keepalive_interval = tokio::time::interval_at(tokio::time::Instant::now() + iv, iv);
             let mut inbound_open = true;
+            let mut pending_inbound: Option<Bytes> = None;
             let mut reauthentication: Option<ReauthenticationFuture> = None;
 
             loop {
@@ -493,7 +494,16 @@ impl GwClient {
 
                         gw.io.send_bytes(&wsbuf[..pos]).await?;
                     },
-                    next = gw.io.read_packet_buf() => {
+                    permit = in_tx.reserve(), if pending_inbound.is_some() => {
+                        let data = pending_inbound.take().expect("pending inbound data is present");
+                        match permit {
+                            Ok(permit) => permit.send(data),
+                            // Reader gone or shutdown closed the inbound channel.
+                            // Keep draining outbound bytes before closing the WebSocket.
+                            Err(_) => inbound_open = false,
+                        }
+                    },
+                    next = gw.io.read_packet_buf(), if pending_inbound.is_none() => {
                         // A clean close or an exhausted stream ends the work task with
                         // `Ok`, so readers observe end-of-stream rather than an error.
                         let Some(msg) = next? else {
@@ -510,10 +520,8 @@ impl GwClient {
                             },
                             PktTy::Data => {
                                 let p = HttpDataPkt::decode(&mut cur).map_err(|e| custom_err!("PktDecode", e))?;
-                                if inbound_open && in_tx.send(Bytes::from(p.data.to_vec())).await.is_err() {
-                                    // Reader gone or shutdown closed the inbound channel.
-                                    // Keep draining outbound bytes before closing the WebSocket.
-                                    inbound_open = false;
+                                if inbound_open {
+                                    pending_inbound = Some(Bytes::from(p.data.to_vec()));
                                 }
                             },
                             PktTy::ServiceMessage => {
@@ -962,9 +970,8 @@ impl AsyncWrite for GwClient {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> Poll<Result<(), io::Error>> {
-        // Closing the outbound sender ends the write queue. Closing the inbound
-        // receiver unblocks a worker parked on `in_tx.send` when the caller is not
-        // reading, so the work task can close the WebSocket and finish.
+        // Closing the outbound sender lets the work task close the WebSocket and
+        // finish. Closing the inbound receiver stops any further inbound tx.
         self.tx.close();
         self.rx.close();
         if self.work_done {

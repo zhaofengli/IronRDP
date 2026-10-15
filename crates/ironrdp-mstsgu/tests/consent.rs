@@ -13,7 +13,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use ironrdp_mstsgu::test_support::{GatewayTransport, evaluate_consent_message};
 use ironrdp_mstsgu::{GwConnectTarget, GwErrorKind, GwExtendedAuthentication, GwSessionAuthentication};
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 type TestBody = BoxBody<Bytes, Infallible>;
 
@@ -535,7 +535,7 @@ async fn reauthentication_uses_a_fresh_tunnel_and_preserves_the_data_transport()
         .await
         .expect("send initial response");
     let initial_out_server = tokio::spawn(mock_streaming_out_server(initial_out_server, initial_out_rx));
-    let initial_in_server = tokio::spawn(mock_in_server(initial_in_server, None, None));
+    let initial_in_server = tokio::spawn(mock_in_server(initial_in_server, None, None, None));
     let reauth_out_server = tokio::spawn(mock_out_server(
         reauth_out_server,
         vec![
@@ -549,6 +549,7 @@ async fn reauthentication_uses_a_fresh_tunnel_and_preserves_the_data_transport()
         reauth_in_server,
         Some(reauth_tunnel_context),
         Some(reauth_complete_tx),
+        None,
     ));
 
     let initial_transport = GatewayTransport::connect(initial_out_client, initial_in_client)
@@ -607,7 +608,7 @@ async fn failed_reauthentication_preserves_the_data_transport() {
         .await
         .expect("send initial response");
     let initial_out_server = tokio::spawn(mock_streaming_out_server(initial_out_server, initial_out_rx));
-    let initial_in_server = tokio::spawn(mock_in_server(initial_in_server, None, None));
+    let initial_in_server = tokio::spawn(mock_in_server(initial_in_server, None, None, None));
     let reauth_out_server = tokio::spawn(mock_out_server(
         reauth_out_server,
         vec![
@@ -679,7 +680,7 @@ async fn reauthentication_consent_requires_an_owned_callback() {
         .await
         .expect("send initial response");
     let initial_out_server = tokio::spawn(mock_streaming_out_server(initial_out_server, initial_out_rx));
-    let initial_in_server = tokio::spawn(mock_in_server(initial_in_server, None, None));
+    let initial_in_server = tokio::spawn(mock_in_server(initial_in_server, None, None, None));
     let reauth_out_server = tokio::spawn(mock_out_server(
         reauth_out_server,
         vec![
@@ -740,6 +741,64 @@ fn malformed_consent_payload_is_rejected_before_callback() {
 
     assert!(matches!(error.kind(), GwErrorKind::Decode));
     assert_eq!(*callback_count.lock().expect("callback count lock"), 0);
+}
+
+#[tokio::test]
+async fn outbound_data_flows_while_inbound_queue_is_full() {
+    /// More inbound packets than the channel size (4 + 1 parked packet).
+    const INBOUND_PACKET_COUNT: u8 = 8;
+    const INBOUND_PACKET_SIZE: usize = 32;
+    const OUTBOUND_DATA: &[u8] = b"outbound while inbound is full";
+
+    let (out_client, out_server) = tokio::io::duplex(4096);
+    let (in_client, in_server) = tokio::io::duplex(4096);
+    let (outbound_tx, outbound_rx) = tokio::sync::oneshot::channel();
+
+    let mut out_packets = vec![
+        packet(2, &handshake_response(0)),
+        packet(5, &tunnel_response(0, &[])),
+        packet(7, &control_response(0)),
+        packet(9, &control_response(0)),
+    ];
+    out_packets.extend((0..INBOUND_PACKET_COUNT).map(|index| data_packet(&[index; INBOUND_PACKET_SIZE])));
+    let out_server = tokio::spawn(mock_out_server(out_server, out_packets));
+    let in_server = tokio::spawn(mock_in_server(in_server, None, None, Some(outbound_tx)));
+
+    let transport = GatewayTransport::connect(out_client, in_client)
+        .await
+        .expect("connect transport");
+    let mut client = transport
+        .connect_tunnel(test_target(), "client.test", 3389, None)
+        .await
+        .expect("connect tunnel");
+
+    // so that the worker fills up the inbound channel
+    for _ in 0..512 {
+        tokio::task::yield_now().await;
+    }
+
+    client.write_all(OUTBOUND_DATA).await.expect("queue outbound data");
+    let outbound = tokio::time::timeout(core::time::Duration::from_secs(1), outbound_rx)
+        .await
+        .expect("outbound data reached the gateway while inbound was full")
+        .expect("IN server observed outbound data");
+    assert_eq!(outbound, OUTBOUND_DATA);
+
+    let mut inbound = vec![0; usize::from(INBOUND_PACKET_COUNT) * INBOUND_PACKET_SIZE];
+    tokio::time::timeout(core::time::Duration::from_secs(1), client.read_exact(&mut inbound))
+        .await
+        .expect("read inbound data")
+        .expect("inbound data");
+    for (index, chunk) in inbound.chunks(INBOUND_PACKET_SIZE).enumerate() {
+        assert!(
+            chunk.iter().all(|&byte| usize::from(byte) == index),
+            "inbound packet {index} arrived out of order or corrupted"
+        );
+    }
+
+    drop(client);
+    out_server.await.expect("OUT task");
+    in_server.await.expect("IN task");
 }
 
 fn test_target() -> GwConnectTarget {
@@ -917,10 +976,13 @@ async fn mock_in_server(
     stream: tokio::io::DuplexStream,
     reauth_tunnel_context: Option<u64>,
     complete: Option<tokio::sync::oneshot::Sender<()>>,
+    outbound: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
 ) {
     let complete = Arc::new(Mutex::new(complete));
+    let outbound = Arc::new(Mutex::new(outbound));
     let service = service_fn(move |mut request: Request<hyper::body::Incoming>| {
         let complete = Arc::clone(&complete);
+        let outbound = Arc::clone(&outbound);
         async move {
             assert_eq!(request.method(), "RDG_IN_DATA");
             if request.headers().get("content-type").is_none() {
@@ -950,6 +1012,20 @@ async fn mock_in_server(
                         }
                     }
                 }
+            }
+
+            let outbound = outbound.lock().expect("outbound lock").take();
+            if let Some(outbound) = outbound {
+                let frame = request
+                    .body_mut()
+                    .frame()
+                    .await
+                    .expect("IN request frame")
+                    .expect("IN request frame result")
+                    .into_data()
+                    .expect("IN request data frame");
+                assert_eq!(packet_type(&frame), 10);
+                outbound.send(frame[10..].to_vec()).expect("send outbound data");
             }
 
             if let Some(complete) = complete.lock().expect("completion lock").take() {
